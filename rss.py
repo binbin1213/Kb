@@ -1,4 +1,3 @@
-```python:/Users/binbin/Documents/rss/rss.py
 import os
 import json
 import feedparser
@@ -19,18 +18,8 @@ import certifi
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 全局配置
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
-import base64
+RSS_URL = config.RSS_URL
 
-# 从config.py获取AES密钥和加密后的URL
-AES_KEY = config.AES_KEY
-RSS_URL_ENCRYPTED = config.RSS_URL_ENCRYPTED
-
-# 解密URL
-cipher = AES.new(AES_KEY, AES.MODE_ECB)
-RSS_URL = unpad(cipher.decrypt(base64.b64decode(RSS_URL_ENCRYPTED)), AES.block_size).decode('utf-8')
 CERT_FILE = config.CERT_FILE
 DATA_FILE = config.DATA_FILE
 USER_AGENT = config.USER_AGENT
@@ -38,14 +27,30 @@ TIMEOUT = config.TIMEOUT
 RETRIES = config.RETRIES
 
 def load_downloaded() -> Dict:
-    """加载已下载记录"""
+    """加载并验证已下载记录"""
+    valid_records = {}
     try:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                records = json.load(f)
+                
+                for link, record in records.items():
+                    file_path = record.get('path', '')
+                    if os.path.exists(file_path):
+                        # 添加文件修改时间校验
+                        record_mtime = record.get('mtime', 0)
+                        current_mtime = os.path.getmtime(file_path)
+                        
+                        if current_mtime == record_mtime:
+                            valid_records[link] = record
+                        else:
+                            logger.warning(f'文件修改时间不一致: {file_path}')
+                    else:
+                        logger.warning(f'记录文件不存在: {file_path}')
+    
     except Exception as e:
         logger.error(f"加载记录失败: {str(e)}")
-    return {}
+    return valid_records
 
 def save_downloaded(data: Dict):
     """保存下载记录"""
@@ -94,8 +99,8 @@ def fetch_article_content(url: str) -> str:
         with urllib3.PoolManager(
             headers={"User-Agent": USER_AGENT, "Referer": "https://mp.weixin.qq.com/"},
             retries=urllib3.Retry(total=RETRIES, backoff_factor=0.3),
-            cert_reqs='CERT_REQUIRED',  # 强制要求证书验证
-            ca_certs=certifi.where()  # 使用 certifi 提供的 CA 证书
+            cert_reqs='CERT_OPTIONAL',
+            ca_certs=certifi.where(),
         ) as http:
             response = http.request('GET', url, timeout=TIMEOUT)
             if response.status != 200:
@@ -109,51 +114,69 @@ def fetch_article_content(url: str) -> str:
 
 def parse_rss(rss_url: str) -> List[Dict]:
     """解析RSS订阅"""
-    try:
-        ssl_context = ssl.create_default_context(cafile=CERT_FILE)
-        with urllib3.PoolManager(
-            ssl_context=ssl_context,
-            headers={"User-Agent": USER_AGENT}
-        ) as http:
-            response = http.request('GET', rss_url, timeout=TIMEOUT)
-            feed = feedparser.parse(response.data)
-        
-        articles = []
-        for entry in feed.entries:
-            try:
-                # 修复公众号名称提取逻辑
-                author = "未知公众号"
-                
-                # 方法1：尝试从author字段获取
-                if hasattr(entry, 'author'):
-                    author = sanitize_filename(entry.author)
-                
-                # 方法2：尝试从分类信息获取（适用于某些Atom源）
-                elif hasattr(entry, 'tags') and entry.tags:
-                    author = sanitize_filename(entry.tags[0].term)
-                
-                # 方法3：尝试从标题前缀提取（示例："【公众号名】文章标题"）
-                else:
-                    match = re.match(r'【(.*?)】', entry.title)
-                    if match:
-                        author = sanitize_filename(match.group(1))
-                
-                # 解析日期
-                date_str = entry.get('published', entry.get('updated', ''))
-                published = parser.parse(date_str).strftime("%Y-%m-%d %H:%M:%S")
-                
-                articles.append({
-                    "title": entry.title.strip(),
-                    "link": entry.link,
-                    "author": author,
-                    "published": published
-                })
-            except Exception as e:
-                logger.warning(f"解析条目失败: {str(e)}", exc_info=True)
-        return articles
-    except Exception as e:
-        logger.error(f"RSS解析失败: {str(e)}")
-        return []
+    articles = []
+    feed = feedparser.FeedParserDict()
+    # 进一步增加重试次数
+    max_retries = RETRIES * 5
+    for attempt in range(max_retries):
+        try:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            ssl_context.check_hostname = True
+            ssl_context.verify_mode = ssl.CERT_REQUIRED
+            with urllib3.PoolManager(
+                ssl_context=ssl_context,
+                headers={"User-Agent": USER_AGENT}
+            ) as http:
+                # 增加超时时间
+                response = http.request('GET', rss_url, timeout=TIMEOUT * 5)
+                feed = feedparser.parse(response.data)
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                # 优化错误日志
+                logger.warning(f'RSS解析尝试 {attempt + 1}/{max_retries} 失败，将在3秒后重试: {str(e)}')
+                import time
+                time.sleep(3)
+            else:
+                logger.error(f'RSS解析失败，已达到最大重试次数: {str(e)}')
+                return []
+
+    articles = []
+    if hasattr(feed, 'bozo') and feed.bozo == 0 and hasattr(feed, 'entries'):
+            for entry in feed.entries:
+                try:
+                    # 修复公众号名称提取逻辑
+                    author = "未知公众号"
+                    
+                    # 方法1：尝试从author字段获取
+                    if hasattr(entry, 'author'):
+                        author = sanitize_filename(entry.author)
+                    
+                    # 方法2：尝试从分类信息获取（适用于某些Atom源）
+                    elif hasattr(entry, 'tags') and entry.tags:
+                        author = sanitize_filename(entry.tags[0].term)
+                    
+                    # 方法3：尝试从标题前缀提取（示例："【公众号名】文章标题"）
+                    else:
+                        match = re.match(r'【(.*?)】', entry.title)
+                        if match:
+                            author = sanitize_filename(match.group(1))
+                    
+                    # 解析日期
+                    date_str = entry.get('published', entry.get('updated', ''))
+                    published = parser.parse(date_str).strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    articles.append({
+                        "title": entry.title.strip(),
+                        "link": entry.link,
+                        "author": author,
+                        "published": published
+                    })
+                except Exception as e:
+                    logger.warning(f"解析条目失败: {str(e)}", exc_info=True)
+    return articles if articles else []
+    
+    return articles if articles else []
 
 
 def main():
@@ -170,8 +193,27 @@ def main():
     new_count = 0
     for article in articles:
         # 检查是否已下载
-        if article['link'] in downloaded:
-            logger.info(f'文章 {article["title"]} 已下载，跳过')
+        # 检查记录和文件是否存在
+        record = downloaded.get(article['link'])
+        file_exists = False
+        
+        if record:
+            file_path = record.get('path', '')
+            file_exists = os.path.exists(file_path)
+            
+            if not file_exists:
+                del downloaded[article['link']]
+                logger.warning(f'发现无效记录：{file_path} 文件已不存在，已清理该记录')
+                continue
+
+            # 检查文件修改时间是否一致
+            current_mtime = os.path.getmtime(file_path)
+            if current_mtime != record.get('mtime', 0):
+                logger.warning(f'文件修改时间不一致: {file_path}')
+                file_exists = False
+            
+        if record and file_exists:
+            logger.info(f'文章 {article["title"]} 已存在，跳过')
             continue
         
         logger.info(f'开始抓取文章 {article["title"]} 内容')
@@ -194,7 +236,9 @@ def main():
             date_part = datetime.now().strftime("%Y%m%d")
         
         filename = f"{date_part}_{safe_title}.md"
-        filepath = os.path.join(author_dir, filename)
+        month_dir = os.path.join(author_dir, date_part[:6])
+        os.makedirs(month_dir, exist_ok=True)
+        filepath = os.path.join(month_dir, filename)
         
         # 保存文件
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -208,7 +252,8 @@ def main():
             "title": article['title'],
             "author": article['author'],
             "date": article['published'],
-            "path": filepath
+            "path": filepath,
+            "mtime": os.path.getmtime(filepath)
         }
         new_count += 1
         logger.info(f'已保存: {filepath}')
