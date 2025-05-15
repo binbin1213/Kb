@@ -1,3 +1,4 @@
+```python:/Users/binbin/Documents/rss/rss.py
 import os
 import json
 import feedparser
@@ -19,7 +20,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # 全局配置
-RSS_URL = config.RSS_URL
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+import base64
+
+# 从config.py获取AES密钥和加密后的URL
+AES_KEY = config.AES_KEY
+RSS_URL_ENCRYPTED = config.RSS_URL_ENCRYPTED
+
+# 解密URL
+cipher = AES.new(AES_KEY, AES.MODE_ECB)
+RSS_URL = unpad(cipher.decrypt(base64.b64decode(RSS_URL_ENCRYPTED)), AES.block_size).decode('utf-8')
 CERT_FILE = config.CERT_FILE
 DATA_FILE = config.DATA_FILE
 USER_AGENT = config.USER_AGENT
@@ -146,35 +157,42 @@ def parse_rss(rss_url: str) -> List[Dict]:
 
 
 def main():
+    logger.info('开始执行主函数')
     downloaded = load_downloaded()
+    logger.info(f'已加载 {len(downloaded)} 条下载记录')
     articles = parse_rss(RSS_URL)
+    logger.info(f'解析到 {len(articles)} 篇文章')
     
     if not articles:
-        logger.warning("未获取到文章")
+        logger.warning('未获取到文章')
         return
 
     new_count = 0
     for article in articles:
         # 检查是否已下载
         if article['link'] in downloaded:
+            logger.info(f'文章 {article["title"]} 已下载，跳过')
             continue
-            
+        
+        logger.info(f'开始抓取文章 {article["title"]} 内容')
         content = fetch_article_content(article['link'])
         if not content:
+            logger.warning(f'文章 {article["title"]} 内容抓取失败，跳过')
             continue
         
         # 创建公众号目录
         author_dir = sanitize_filename(article['author'])
         os.makedirs(author_dir, exist_ok=True)
+        logger.info(f'已创建/使用公众号目录 {author_dir}')
         
         # 生成文件名
         safe_title = sanitize_filename(article['title'])
         try:
             date_part = datetime.strptime(article['published'], "%Y-%m-%d %H:%M:%S").strftime("%Y%m%d")
         except ValueError:
-            logger.warning(f"日期格式解析失败，使用当前日期替代: {article['published']}")
+            logger.warning(f'日期格式解析失败，使用当前日期替代: {article["published"]}')
             date_part = datetime.now().strftime("%Y%m%d")
-            
+        
         filename = f"{date_part}_{safe_title}.md"
         filepath = os.path.join(author_dir, filename)
         
@@ -193,13 +211,14 @@ def main():
             "path": filepath
         }
         new_count += 1
-        logger.info(f"已保存: {filepath}")
+        logger.info(f'已保存: {filepath}')
     
     if new_count > 0:
         save_downloaded(downloaded)
-        logger.info(f"成功下载 {new_count}/{len(articles)} 篇新文章")
+        logger.info(f'成功下载 {new_count}/{len(articles)} 篇新文章')
     else:
-        logger.info("没有发现新文章")
+        logger.info('没有发现新文章')
+    logger.info('主函数执行结束')
 
 if __name__ == "__main__":
     main()
