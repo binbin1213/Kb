@@ -12,15 +12,15 @@ from dateutil import parser
 import html2text
 from urllib.parse import urljoin
 import config
-import certifi
+import config
+
+# 支持多订阅源
+RSS_URLS = config.RSS_URLS
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-RSS_URL = config.RSS_URL
-
-CERT_FILE = config.CERT_FILE
 DATA_FILE = config.DATA_FILE
 USER_AGENT = config.USER_AGENT
 TIMEOUT = config.TIMEOUT
@@ -183,7 +183,11 @@ def main():
     logger.info('开始执行主函数')
     downloaded = load_downloaded()
     logger.info(f'已加载 {len(downloaded)} 条下载记录')
-    articles = parse_rss(RSS_URL)
+    all_articles = []
+for url in RSS_URLS:
+    articles = parse_rss(url)
+    all_articles.extend(articles)
+articles = all_articles
     logger.info(f'解析到 {len(articles)} 篇文章')
     
     if not articles:
