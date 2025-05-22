@@ -1,0 +1,4 @@
+# 每天凌晨2点自动上传RSS项目到GitHub
+0 2 * * * cd /Users/binbin/Documents/rss && ./auto_push.sh >> /Users/binbin/Documents/rss/git_push.log 2>&1
+# 保留原有的定时任务
+0 0 * * * /usr/bin/python3 /Users/binbin/Documents/md克隆/backup_system.py 

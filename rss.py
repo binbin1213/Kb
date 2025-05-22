@@ -4,15 +4,16 @@ import feedparser
 import ssl
 import urllib3
 import re
+import certifi
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Any
 import logging
 from bs4 import BeautifulSoup
 from dateutil import parser
 import html2text
 from urllib.parse import urljoin
 import config
-import config
+from md_formatter import html_to_markdown
 
 # 支持多订阅源
 RSS_URLS = config.RSS_URLS
@@ -70,6 +71,8 @@ def sanitize_filename(name: str) -> str:
     Returns:
         str: 清理后的文件名。
     """
+    if not isinstance(name, str):
+        name = str(name)
     return re.sub(r'[\\/*?:"<>|]', '', name).strip()[:100]
 
 def process_images(html: str, base_url: str) -> str:
@@ -85,37 +88,90 @@ def process_images(html: str, base_url: str) -> str:
         img['style'] = "max-width: 100%; height: auto;"
     return str(soup)
 
-def html_to_markdown(html: str) -> str:
-    """HTML转Markdown"""
-    converter = html2text.HTML2Text()
-    converter.body_width = 0
-    converter.ignore_images = False
-    converter.images_as_html = True
-    return converter.handle(html).strip()
-
 def fetch_article_content(url: str) -> str:
     """获取文章内容"""
     try:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Referer": "https://www.google.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        
+        logger.info(f'正在获取文章内容: {url}')
         with urllib3.PoolManager(
-            headers={"User-Agent": USER_AGENT, "Referer": "https://mp.weixin.qq.com/"},
+            headers=headers,
             retries=urllib3.Retry(total=RETRIES, backoff_factor=0.3),
-            cert_reqs='CERT_OPTIONAL',
+            cert_reqs='CERT_NONE',  # 禁用SSL验证
             ca_certs=certifi.where(),
         ) as http:
             response = http.request('GET', url, timeout=TIMEOUT)
             if response.status != 200:
+                logger.warning(f'获取文章内容失败，状态码: {response.status}')
                 return ""
-            soup = BeautifulSoup(response.data, 'html.parser')
-            content_div = soup.find('div', class_='rich_media_content')
-            return html_to_markdown(process_images(str(content_div), url)) if content_div else ""
+                
+            content_type = response.headers.get('Content-Type', '')
+            logger.info(f'文章内容类型: {content_type}')
+            
+            # 尝试确定编码
+            encoding = 'utf-8'
+            if 'charset=' in content_type:
+                encoding = content_type.split('charset=')[-1].strip()
+            
+            html_content = response.data.decode(encoding, errors='replace')
+            logger.info(f'文章HTML长度: {len(html_content)}')
+            
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # 针对不同网站尝试不同的选择器
+            content_div = None
+            
+            # 少数派
+            if 'sspai.com' in url:
+                content_div = soup.find('div', class_='normal-article-content')
+            # 阮一峰的博客
+            elif 'ruanyifeng.com' in url:
+                content_div = soup.find('div', class_='entry-content')
+            # 微信公众号
+            elif 'mp.weixin.qq.com' in url:
+                content_div = soup.find('div', class_='rich_media_content')
+            # 36kr
+            elif '36kr.com' in url:
+                content_div = soup.find('div', class_='article-content')
+            # 知乎
+            elif 'zhihu.com' in url:
+                content_div = soup.find('div', class_='Post-RichTextContainer')
+            # 通用方案，尝试一些常见的内容容器类名
+            else:
+                for class_name in ['article-content', 'post-content', 'entry-content', 'content', 'article', 'post']:
+                    content_div = soup.find('div', class_=class_name)
+                    if content_div:
+                        break
+            
+            if not content_div:
+                logger.warning(f'无法找到文章内容: {url}')
+                # 保存第一个主要div作为备选
+                main_div = soup.find('div', id='main') or soup.find('main') or soup.find('article')
+                if main_div:
+                    content_div = main_div
+                else:
+                    # 最后的备选：使用body
+                    content_div = soup.find('body')
+            
+            if content_div:
+                processed_content = process_images(str(content_div), url)
+                return html_to_markdown(processed_content)
+            else:
+                return "无法解析文章内容"
     except Exception as e:
         logger.error(f"内容抓取失败 {url}: {str(e)}")
         return ""
 
-def parse_rss(rss_url: str) -> List[Dict]:
+def parse_rss(rss_url: str) -> List[Dict[str, Any]]:
     """解析RSS订阅"""
     articles = []
-    feed = feedparser.FeedParserDict()
     # 进一步增加重试次数
     max_retries = RETRIES * 5
     for attempt in range(max_retries):
@@ -129,7 +185,22 @@ def parse_rss(rss_url: str) -> List[Dict]:
             ) as http:
                 # 增加超时时间
                 response = http.request('GET', rss_url, timeout=TIMEOUT * 5)
+                logger.info(f'RSS源 {rss_url} 状态码: {response.status}')
+                
+                # 打印RSS源返回的内容前500个字符（调试用）
+                content_preview = response.data.decode('utf-8', errors='replace')[:500]
+                logger.info(f'RSS源内容预览: {content_preview}')
+                
                 feed = feedparser.parse(response.data)
+                
+                # 打印解析后的feed信息
+                if hasattr(feed, 'feed') and hasattr(feed.feed, 'title'):
+                    logger.info(f'RSS源标题: {feed.feed.title}')
+                if hasattr(feed, 'entries'):
+                    logger.info(f'RSS源条目数量: {len(feed.entries)}')
+                else:
+                    logger.warning('RSS源没有entries属性')
+                
             break
         except Exception as e:
             if attempt < max_retries - 1:
@@ -141,41 +212,72 @@ def parse_rss(rss_url: str) -> List[Dict]:
                 logger.error(f'RSS解析失败，已达到最大重试次数: {str(e)}')
                 return []
 
-    articles = []
-    if hasattr(feed, 'bozo') and feed.bozo == 0 and hasattr(feed, 'entries'):
-            for entry in feed.entries:
+    if hasattr(feed, 'entries'):
+        for entry in feed.entries:
+            try:
+                # 修复公众号名称提取逻辑
+                author = "未知公众号"
+                
+                # 方法1：尝试从author字段获取
+                if hasattr(entry, 'author'):
+                    author = sanitize_filename(str(entry.author))
+                
+                # 方法2：尝试从分类信息获取（适用于某些Atom源）
+                elif hasattr(entry, 'tags') and entry.tags:
+                    author = sanitize_filename(str(entry.tags[0].term))
+                
+                # 方法3：尝试从标题前缀提取（示例："【公众号名】文章标题"）
+                elif hasattr(entry, 'title'):
+                    match = re.match(r'【(.*?)】', str(entry.title))
+                    if match:
+                        author = sanitize_filename(match.group(1))
+                
+                # 尝试使用feed标题作为作者
+                elif hasattr(feed, 'feed') and hasattr(feed.feed, 'title'):
+                    author = sanitize_filename(str(feed.feed.title))
+                
+                # 解析日期
+                date_str = ''
+                if hasattr(entry, 'published'):
+                    date_str = entry.published
+                elif hasattr(entry, 'updated'):
+                    date_str = entry.updated
+                
+                if not date_str:
+                    # 如果没有日期，使用当前时间
+                    published = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    logger.warning(f'文章没有日期信息，使用当前时间: {published}')
+                else:
+                    published = parser.parse(str(date_str)).strftime("%Y-%m-%d %H:%M:%S")
+                
+                # 确保标题和链接存在
                 try:
-                    # 修复公众号名称提取逻辑
-                    author = "未知公众号"
-                    
-                    # 方法1：尝试从author字段获取
-                    if hasattr(entry, 'author'):
-                        author = sanitize_filename(entry.author)
-                    
-                    # 方法2：尝试从分类信息获取（适用于某些Atom源）
-                    elif hasattr(entry, 'tags') and entry.tags:
-                        author = sanitize_filename(entry.tags[0].term)
-                    
-                    # 方法3：尝试从标题前缀提取（示例："【公众号名】文章标题"）
-                    else:
-                        match = re.match(r'【(.*?)】', entry.title)
-                        if match:
-                            author = sanitize_filename(match.group(1))
-                    
-                    # 解析日期
-                    date_str = entry.get('published', entry.get('updated', ''))
-                    published = parser.parse(date_str).strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    articles.append({
-                        "title": entry.title.strip(),
-                        "link": entry.link,
-                        "author": author,
-                        "published": published
-                    })
-                except Exception as e:
-                    logger.warning(f"解析条目失败: {str(e)}", exc_info=True)
-    return articles if articles else []
+                    title = str(getattr(entry, 'title', "无标题")).strip()
+                except:
+                    title = "无标题"
+                
+                try:
+                    link = str(getattr(entry, 'link', ""))
+                except:
+                    link = ""
+                
+                if not link:
+                    logger.warning(f'文章没有链接，跳过: {title}')
+                    continue
+                
+                articles.append({
+                    "title": title,
+                    "link": link,
+                    "author": author,
+                    "published": published
+                })
+                logger.info(f'成功解析文章: {title}')
+            except Exception as e:
+                logger.warning(f"解析条目失败: {str(e)}", exc_info=True)
+    else:
+        logger.warning(f'RSS源不包含任何文章条目')
     
+    logger.info(f'从RSS源 {rss_url} 解析到 {len(articles)} 篇文章')
     return articles if articles else []
 
 
@@ -184,10 +286,10 @@ def main():
     downloaded = load_downloaded()
     logger.info(f'已加载 {len(downloaded)} 条下载记录')
     all_articles = []
-for url in RSS_URLS:
-    articles = parse_rss(url)
-    all_articles.extend(articles)
-articles = all_articles
+    for url in RSS_URLS:
+        articles = parse_rss(url)
+        all_articles.extend(articles)
+    articles = all_articles
     logger.info(f'解析到 {len(articles)} 篇文章')
     
     if not articles:
