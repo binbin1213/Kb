@@ -11,8 +11,9 @@ RUN apt-get update -y && \
     rm -rf /var/lib/apt/lists/*
 
 # 替换为清华镜像源
-RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    sed -i 's/security.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
+# 由于文件可能不存在，暂时注释替换源操作
+# RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && 
+#     sed -i 's/security.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
 
 COPY . /app
 RUN mkdir -p /app/downloads
